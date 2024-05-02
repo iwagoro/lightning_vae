@@ -1,50 +1,29 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pytorch_lightning as pl
+from lightning.pytorch import LightningModule
+from dsconv import depthwise_separable_conv
+from spconv import sub_pixel_conv
 
-class depthwise_separable_conv(nn.Module):
-    def __init__(self, nin, nout, kernel_size=3, padding=1, bias=False):
-        super(depthwise_separable_conv, self).__init__()
-        self.depthwise = nn.Conv2d(
-            nin, nin, kernel_size=kernel_size, padding=padding, groups=nin, bias=bias
-        )
-        self.pointwise = nn.Conv2d(nin, nout, kernel_size=1, bias=bias)
 
-    def forward(self, x):
-        out = self.depthwise(x)
-        out = self.pointwise(out)
-        return out
-    
-    
-class depthwise_separable_conv_transpose(nn.Module):
-    def __init__(self, nin, nout, kernel_size=3, padding=1, bias=False):
-        super(depthwise_separable_conv_transpose, self).__init__()
-        self.depthwise = nn.ConvTranspose2d(
-            nin, nin, kernel_size=kernel_size, padding=padding, groups=nin, bias=bias 
-        )
-        self.pointwise = nn.Conv2d(nin, nout, kernel_size=1, bias=bias)
-
-    def forward(self, x):
-        out = self.depthwise(x)
-        out = self.pointwise(out)
-        return out
-    
 
 class Encoder(nn.Module):
     def __init__(self):
         super(Encoder, self).__init__()
         self.encoder = nn.Sequential(
-            depthwise_separable_conv(1, 64, kernel_size=3, padding=1),
+            depthwise_separable_conv(1, 32, kernel_size=3, padding=1), #16
             nn.ReLU(),
             nn.MaxPool2d(2),
-            depthwise_separable_conv(64, 128, kernel_size=3, padding=1),
+            depthwise_separable_conv(32, 64, kernel_size=3, padding=1),# 8
             nn.ReLU(),
             nn.MaxPool2d(2),
-            depthwise_separable_conv(128, 256, kernel_size=3, padding=1),
+            depthwise_separable_conv(64, 128, kernel_size=3, padding=1), #4
             nn.ReLU(),
             nn.MaxPool2d(2),
-            depthwise_separable_conv(256, 512, kernel_size=3, padding=1),
+            depthwise_separable_conv(128, 256, kernel_size=3, padding=1),# 2
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            depthwise_separable_conv(256, 512, kernel_size=3, padding=1),# 1
             nn.ReLU(),
             nn.MaxPool2d(2),
             nn.Flatten(),
@@ -59,6 +38,7 @@ class Encoder(nn.Module):
         ep = torch.randn_like(mu)
         z = mu + torch.exp(dev / 2) * ep
         return z,mu,dev
+        return x
 
 
 class Decoder(nn.Module):
@@ -66,21 +46,25 @@ class Decoder(nn.Module):
         super(Decoder,self).__init__()
         self.linear = nn.Linear(2,512)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, kernel_size=3, stride=2),
+            sub_pixel_conv(512,256,2),#2
             nn.ReLU(),
-            nn.ConvTranspose2d(256, 128, kernel_size=3, stride=2),
+            sub_pixel_conv(256,128,2),#4
             nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+            sub_pixel_conv(128,64,2),#8
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 1, kernel_size=2, stride=2),
+            sub_pixel_conv(64,32,2),#16
+            nn.ReLU(),
+            sub_pixel_conv(32,16,2),#32
+            nn.ReLU(),
             nn.Sigmoid()
         )
+        self.pointwise = nn.Conv2d(16,1,1)
 
     def forward(self, x):
         x = self.linear(x)
-        x = x.view(-1, 512, 1, 1)
+        x = x.view(-1,512,1,1)
         x = self.decoder(x)
-        
+        x = self.pointwise(x)
         return x
 
 
@@ -93,7 +77,7 @@ def vae_loss(x, x_hat, mu, log_var):
     vae_loss = reconstruction_loss + kl_divergence_loss
     return vae_loss
 
-class AutoEncoder(pl.LightningModule):
+class AutoEncoder(LightningModule):
     def __init__(self):
         super(AutoEncoder,self).__init__()
         self.encoder = Encoder()
@@ -109,7 +93,8 @@ class AutoEncoder(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, _ = batch
         x_hat = self(x)  # 生成された画像
-        loss = vae_loss(x, x_hat, self.mu, self.dev)
+        # loss = vae_loss(x, x_hat, self.mu, self.dev)
+        loss = nn.MSELoss()(x_hat, x)
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
@@ -117,6 +102,9 @@ class AutoEncoder(pl.LightningModule):
         
         example_img,_ = batch
         predicted_img = self.forward(example_img)
+        # loss = vae_loss(example_img, predicted_img, self.mu, self.dev)
+        loss = nn.MSELoss()(example_img,predicted_img)
+        self.log("val_loss", loss, prog_bar=True)
         self.logger.experiment.add_image("generated_images", predicted_img[0], self.current_epoch)
         
     def configure_optimizers(self):
